@@ -260,6 +260,7 @@ class BasicAVTransformerBlock(nn.Module):
     def forward(
         self, x: Tuple[torch.Tensor, torch.Tensor], v_context=None, a_context=None, attention_mask=None, v_timestep=None, a_timestep=None,
         v_pe=None, a_pe=None, v_cross_pe=None, a_cross_pe=None, v_cross_scale_shift_timestep=None, a_cross_scale_shift_timestep=None,
+        a_cross_scale_shift_timestep_a2v=None,
         v_cross_gate_timestep=None, a_cross_gate_timestep=None, transformer_options=None, self_attention_mask=None,
         v_prompt_timestep=None, a_prompt_timestep=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -316,8 +317,9 @@ class BasicAVTransformerBlock(nn.Module):
 
             # audio to video cross attention
             if run_a2v:
+                a2v_in_ts = a_cross_scale_shift_timestep if a_cross_scale_shift_timestep_a2v is None else a_cross_scale_shift_timestep_a2v
                 scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v = self.get_ada_values(
-                    self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0], a_cross_scale_shift_timestep)[:2]
+                    self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0], a2v_in_ts)[:2]
                 scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v = self.get_ada_values(
                     self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0], v_cross_scale_shift_timestep)[:2]
 
@@ -326,6 +328,7 @@ class BasicAVTransformerBlock(nn.Module):
                 else:
                     vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v)
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
+                ax_scaled = ax_scaled * transformer_options.get("a2v_in_scale", 1.0)
                 del scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v, scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v
 
                 a2v_out = self.audio_to_video_attn(vx_scaled, context=ax_scaled, pe=v_cross_pe, k_pe=a_cross_pe, transformer_options=transformer_options)
@@ -794,6 +797,22 @@ class LTXAVModel(LTXVModel):
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
+            av_ca_audio_scale_shift_timestep_a2v = None
+            if kwargs.get("a2v_in_timestep", "audio") == "video":
+                # Same learned projection, the VIDEO sigma instead of the audio
+                # one. A frozen track pins the audio timestep at 0 for the whole
+                # schedule, which is what over-exposes the video to it early.
+                # timestep_scaled is per VIDEO token, so broadcast its max over
+                # the audio tokens - exactly what av_ca_v2a_gate_noise_timestep
+                # below already does in the mirror direction.
+                av_ca_audio_scale_shift_timestep_a2v, _ = self.av_ca_audio_scale_shift_adaln_single(
+                    timestep_scaled.max().expand_as(a_timestep_flat),
+                    {"resolution": None, "aspect_ratio": None},
+                    batch_size=batch_size,
+                    hidden_dtype=hidden_dtype,
+                )
+                av_ca_audio_scale_shift_timestep_a2v = av_ca_audio_scale_shift_timestep_a2v.view(
+                    batch_size, -1, av_ca_audio_scale_shift_timestep_a2v.shape[-1])
             av_ca_video_scale_shift_timestep, _ = self.av_ca_video_scale_shift_adaln_single(
                 timestep_flat,
                 {"resolution": None, "aspect_ratio": None},
@@ -820,6 +839,7 @@ class LTXAVModel(LTXVModel):
                 CompressedTimestep(av_ca_video_scale_shift_timestep.view(batch_size, -1, av_ca_video_scale_shift_timestep.shape[-1]), v_patches_per_frame),  # video - compressed if possible
                 CompressedTimestep(av_ca_a2v_gate_noise_timestep.view(batch_size, -1, av_ca_a2v_gate_noise_timestep.shape[-1]), v_patches_per_frame),  # video - compressed if possible
                 av_ca_v2a_gate_noise_timestep.view(batch_size, -1, av_ca_v2a_gate_noise_timestep.shape[-1]),
+                av_ca_audio_scale_shift_timestep_a2v,  # None unless a2v_in_timestep == "video"
             ]
 
             a_timestep, a_embedded_timestep = self.audio_adaln_single(
@@ -924,6 +944,7 @@ class LTXAVModel(LTXVModel):
             av_ca_video_scale_shift_timestep,
             av_ca_a2v_gate_noise_timestep,
             av_ca_v2a_gate_noise_timestep,
+            av_ca_audio_scale_shift_timestep_a2v,
         ) = timestep[2]
 
         v_prompt_timestep = timestep[3]
@@ -960,6 +981,7 @@ class LTXAVModel(LTXVModel):
                         a_cross_pe=args["a_cross_pe"],
                         v_cross_scale_shift_timestep=args["v_cross_scale_shift_timestep"],
                         a_cross_scale_shift_timestep=args["a_cross_scale_shift_timestep"],
+                        a_cross_scale_shift_timestep_a2v=args.get("a_cross_scale_shift_timestep_a2v"),
                         v_cross_gate_timestep=args["v_cross_gate_timestep"],
                         a_cross_gate_timestep=args["a_cross_gate_timestep"],
                         transformer_options=args["transformer_options"],
@@ -983,6 +1005,7 @@ class LTXAVModel(LTXVModel):
                         "a_cross_pe": av_cross_audio_freq_cis,
                         "v_cross_scale_shift_timestep": av_ca_video_scale_shift_timestep,
                         "a_cross_scale_shift_timestep": av_ca_audio_scale_shift_timestep,
+                        "a_cross_scale_shift_timestep_a2v": av_ca_audio_scale_shift_timestep_a2v,
                         "v_cross_gate_timestep": av_ca_a2v_gate_noise_timestep,
                         "a_cross_gate_timestep": av_ca_v2a_gate_noise_timestep,
                         "transformer_options": block_transformer_options,
@@ -1007,6 +1030,7 @@ class LTXAVModel(LTXVModel):
                     a_cross_pe=av_cross_audio_freq_cis,
                     v_cross_scale_shift_timestep=av_ca_video_scale_shift_timestep,
                     a_cross_scale_shift_timestep=av_ca_audio_scale_shift_timestep,
+                    a_cross_scale_shift_timestep_a2v=av_ca_audio_scale_shift_timestep_a2v,
                     v_cross_gate_timestep=av_ca_a2v_gate_noise_timestep,
                     a_cross_gate_timestep=av_ca_v2a_gate_noise_timestep,
                     transformer_options=block_transformer_options,
