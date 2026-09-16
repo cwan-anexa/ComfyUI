@@ -1228,6 +1228,20 @@ class LTXAV(BaseModel):
 
         return out
 
+    def audio_cond_mode(self):
+        """"frozen" (stock) or "renoise" - how a masked audio stream is fed.
+
+        Neither of the two methods below is handed model_options by its caller,
+        so the key is read off the ModelPatcher that is driving this sample:
+        ModelPatcher.pre_run sets self.current_patcher to itself before the
+        first step, and a node writes
+        model_options["transformer_options"]["ltx_audio_cond"] on its clone.
+        Absent = "frozen" = stock behaviour.
+        """
+        patcher = getattr(self, "current_patcher", None)
+        options = getattr(patcher, "model_options", None) or {}
+        return options.get("transformer_options", {}).get("ltx_audio_cond", "frozen")
+
     def process_timestep(self, timestep, x, denoise_mask=None, audio_denoise_mask=None, **kwargs):
         v_timestep = timestep
         a_timestep = timestep
@@ -1235,12 +1249,42 @@ class LTXAV(BaseModel):
         if denoise_mask is not None:
             v_timestep = self.diffusion_model.patchifier.patchify(((denoise_mask) * timestep.view([timestep.shape[0]] + [1] * (denoise_mask.ndim - 1)))[:, :1])[0]
         if audio_denoise_mask is not None:
-            a_timestep = self.diffusion_model.a_patchifier.patchify(((audio_denoise_mask) * timestep.view([timestep.shape[0]] + [1] * (audio_denoise_mask.ndim - 1)))[:, :1, :, :1])[0]
+            a_mask = audio_denoise_mask
+            if self.audio_cond_mode() == "renoise":
+                # The audio stream now ENTERS the model noised to the current
+                # sigma (scale_latent_inpaint below), so it must be labelled
+                # with the sigma it actually carries rather than with
+                # mask x sigma. A zero mask otherwise pins it at 0 for the whole
+                # schedule - a clean-latent/zero-timestep pairing the base
+                # weights never saw in training.
+                a_mask = torch.ones_like(audio_denoise_mask)
+            a_timestep = self.diffusion_model.a_patchifier.patchify(((a_mask) * timestep.view([timestep.shape[0]] + [1] * (a_mask.ndim - 1)))[:, :1, :, :1])[0]
 
         return v_timestep, a_timestep
 
     def scale_latent_inpaint(self, sigma, noise, latent_image, **kwargs):
-        return latent_image
+        # STOCK ("frozen"): every masked stream enters the model CLEAN at every
+        # step. With "renoise" the AUDIO stream instead enters noised to the
+        # current sigma, which is what BaseModel.scale_latent_inpaint does for
+        # every other inpainted region.
+        #
+        # The VIDEO stream is left clean in BOTH modes on purpose: it carries
+        # its own keyframe mask from LTXVImgToVideoInplace, and how that
+        # conditioning works is not what this change is about.
+        #
+        # The delivered track is unaffected either way - KSamplerX0Inpaint
+        # re-imposes latent_image over the masked region after every step
+        # (`out * denoise_mask + self.latent_image * latent_mask`), so the
+        # words stay bit-exact. And `noise` is the sampler's own draw, already
+        # allocated; in "frozen" mode it simply goes unused here.
+        shapes = self.latent_shapes
+        if self.audio_cond_mode() != "renoise" or shapes is None or len(shapes) < 2:
+            return latent_image
+        cleans = utils.unpack_latents(latent_image, shapes)
+        noises = utils.unpack_latents(noise, shapes)
+        cleans[1] = self.model_sampling.noise_scaling(
+            sigma.reshape([sigma.shape[0]] + [1] * (noises[1].ndim - 1)), noises[1], cleans[1])
+        return utils.pack_latents(cleans)[0]
 
     def map_context_window_to_modalities(self, primary_indices, latent_shapes, dim):
         result = [primary_indices]
