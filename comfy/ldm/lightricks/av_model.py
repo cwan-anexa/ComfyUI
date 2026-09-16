@@ -332,7 +332,7 @@ class BasicAVTransformerBlock(nn.Module):
                 del vx_scaled, ax_scaled
 
                 gate_out_a2v = self.get_ada_values(self.scale_shift_table_a2v_ca_video[4:, :], vx.shape[0], v_cross_gate_timestep)[0]
-                vx.addcmul_(a2v_out, gate_out_a2v)
+                vx.addcmul_(a2v_out, gate_out_a2v * transformer_options.get("a2v_gate_scale", 1.0))
                 del gate_out_a2v, a2v_out
 
             # video to audio cross attention
